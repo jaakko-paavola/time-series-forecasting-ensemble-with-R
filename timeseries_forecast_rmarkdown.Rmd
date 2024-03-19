@@ -1,0 +1,928 @@
+---
+title: "Time series forecasting"
+author: "Jaakko Paavola"
+date: "19 Mar 2024"
+output:
+  html_document:
+    toc: true
+    toc_depth: '3'
+    df_print: paged
+  html_notebook:
+    pandoc_args: "--number-offset=1,0"
+    fig_caption: true
+    number_sections: true
+    toc: true
+    toc_depth: 3
+header-includes:
+- \usepackage{fontspec}
+- \usepackage{amsmath}
+- \usepackage{calligra}
+- \usepackage{amsmath}
+- \defaultfontfeatures[\rmfamily,\sffamily]{Ligatures=TeX,Numbers=OldStyle}
+- \setmainfont{Libertinus Serif}
+- \setsansfont{Libertinus Sans}
+- \setmathfont{Libertinus Math}%[RawFeature={+ss08}
+- \setmonofont{Libertinus Mono}
+- \usepackage{eurosym}
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+Work in progress. The idea of this project is that you can read in any time series (currently tested only with the enclosed united-states-gdp-growth-rate.csv containing quarterly US GDP growth rates), and the program fits the following time series models to it: 1) seasonal regression, 2) trend + seasonal regression, 3) Holt-Winters multiplicative, 4) Holt-Winters additive, 5) ARIMA, 6) ARIMA with box-cox transformation, 7) ETS, and 8) TBATS. It then evaluates the performance of each model against a test set, and picks the "best performer" to forecast from one to four steps into the future (truly out-of-sample). The best performer can be different for each of the four forecasts. Moreover, we also compare the forecasts against two naive baselines for benchmark: 1) predict the value for the same month from last year, and 2) predict the value from the previous datapoint.
+
+```{r}
+options(wid_of_tsth=10000)
+options(setWid_of_tsthOnResize=TRUE)
+```
+
+```{r}
+preprocess_data <- function(since = NULL, query, first.month.to.forecast = NULL){
+  ### Fetches the data and does preprocessing on it. Checks whether there is complete data (data from the last day) from the month before the current one.
+  ### Parameters:
+  ### since: The earliest date for data we want to fetch.
+  ### query: The name of the query.
+  ### prevMonthCheckFlag: TRUE if we want to check whether there is data from the last day of the previous month. Otherwise FALSE.
+  ### Returns: 
+  ### If there was complete data from the previous month, returns the fetched dataset.
+  ### If there was no complete data from the previous month, returns 1.
+  
+  flog.info("Loading data")
+  
+  if (query == "USGDPGR") {
+    # Import data from file "united-states-gdp-growth-rate.csv"
+    data <- read.csv("original_data/united-states-gdp-growth-rate.csv", header = T)
+  }
+
+  # Rename columns in data to "Date" and "Value"
+  colnames(data) <- c("Date", query)
+  data$Date <- as.Date(data$Date, "%d/%m/%Y")
+
+  # since = "2013-02-01"
+  if(!is.null(since)) {
+    since <- as.Date(since, "%Y-%m-%d")
+  }
+ 
+  if(!is.null(since)) {
+    data <- data[data$Date >= since,]
+    data <- data[order(data$Date),]
+  }
+
+  data <- as.data.frame(data)
+  # print(data)
+
+  # if(!is.null(first.month.to.forecast)) {
+  #   if(max(data$Date) < as.Date(as.yearmon(first.month.to.forecast)) - 1) {
+  #     stop(paste0("No complete data from previous month (", month(as.Date(as.yearmon(Sys.Date())) - 1, abbr = TRUE, label = T), ")"))
+  #   }
+  # }
+  
+  return(data)
+}
+
+monthly_decomposition <- function(dataFull, id_of_ts, imputations.output.filename){
+  ### Composes a time series object and does imputations in it.
+  ### Parameters:
+  ### imputations.output.filename: if the parameter is given, the imputation information will be printed out to a file.
+  ### Returns: A list with a time series component with the realized demands as the first element.
+
+  # Fill the time series if there are any NAs
+  index <- as.integer(min(which(!is.na(dataFull[, id_of_ts]))))
+  cleaned_data <- dataFull
+  cleaned_data[, id_of_ts] <- ifelse(is.na(dataFull[, id_of_ts]), 0, dataFull[, id_of_ts])
+  cleaned_data <- cleaned_data[index:nrow(cleaned_data), ]
+  cleaned_data[, id_of_ts] <- na_interpolation(cleaned_data[, id_of_ts])
+  # monthly.ts <- apply.monthly(as.xts(cleaned_data[, id_of_ts], order.by = as.Date(cleaned_data$Date)), sum) # If time steps are shorter than a month, sum them up to month granularity
+
+  # Generate a sequence of the first day of each month between the start and end dates
+  start_date <- floor_date(min(cleaned_data$Date), "month") + months(1)
+  end_date <- ceiling_date(max(cleaned_data$Date), "month")
+  date_seq_first <- seq(from = start_date, to = end_date, by = "month")
+
+  # Adjust to the last day of each month and create a new dataframe with this sequence
+  date_seq_last <- date_seq_first - days(1)
+
+  # Merge with the original, keeping all dates
+  monthly_df <- merge(data.frame(Date = date_seq_last), cleaned_data, by = "Date", all.x = TRUE)
+
+  # Interpolate the missing USGDPGR values using linear interpolation
+  monthly_df$USGDPGR <- round(na.approx(monthly_df$USGDPGR, na.rm = FALSE), 1)
+  monthly.ts <- ts(monthly_df[, id_of_ts], start = c(year(min(monthly_df$Date)), month(min(monthly_df$Date))), frequency = 12)
+  monthly.ts.original <- monthly.ts
+  # imputed <- vector(length = nrow(monthly.ts))
+
+  # for(aux in 1:nrow(monthly.ts)) {
+  #   if(as.numeric(monthly.ts[aux]) < X) { # Impute based on the following rows if the value is under X
+  #     if(aux > 24) { # Impute the average of the sum of one year ago (12) and two years ago (24) if we are over 24 months from the start of the time series
+  #       if((as.numeric(monthly.ts.original[aux - 12]) + as.numeric(monthly.ts.original[aux - 24])) / 2 > as.numeric(monthly.ts.original[aux])) {
+  #         monthly.ts[aux] <- (as.numeric(monthly.ts.original[aux - 12]) + as.numeric(monthly.ts.original[aux - 24])) / 2
+  #         imputed[aux] <- 2
+  #       }
+  #     } else if(aux > 12) { # Impute the value from one year ago if we are over 12 months from the start of the time series
+  #       if(as.numeric(monthly.ts.original[aux - 12]) > as.numeric(monthly.ts.original[aux])) {
+  #         monthly.ts[aux] <- as.numeric(monthly.ts.original[aux - 12])
+  #         imputed[aux] <- 1
+  #       }
+  #     } else if(as.numeric(monthly.ts.original[aux]) < 10) { # If within 12 months from the start, impute Y
+  #       monthly.ts[aux] <- Y
+  #       imputed[aux] <- 3
+  #     }
+  #   }
+  #   if(as.numeric(monthly.ts[aux]) == 0) { # Impute 1 if the value is 0
+  #       monthly.ts[aux] <- 1
+  #       imputed[aux] <- 4
+  #   }
+  # }
+  # If a filename was given, print out the imputation information in a file. 
+  # if (!is.null(imputations.output.filename)) {
+  #   monthly.ts.for.printing <- cbind(monthly.ts, imputed)
+  #   colnames(monthly.ts.for.printing) <-  c(id_of_ts, "Imputed")
+  #   print(monthly.ts.for.printing)
+  #   sink(file = paste("imputations.txt", sep = "_"), append = TRUE)
+  #   print(paste(id_of_ts))
+  #   print(monthly.ts.for.printing)
+  #   sink()
+  # }
+  
+  list.ts <- list(monthly.ts, monthly.ts.original)
+  return(list.ts)
+}
+
+train_ts_models <- function(ts_train, id_of_ts, skipTimeConsumingAlgorithmsFlag){
+### Trains the eight models with the training data.
+### Parameters:
+### ts_train: The time series object.
+  
+  list_mod <- list()
+  
+  list_mod[["TSLM.s"]] <- tryCatch({
+    tslm(ts_train ~ season, lambda="auto")
+  },
+  error=function(cond){
+    message(cond)
+    if(length(ts_train) < 24) {
+      start <- start(ts_train) - c(0, (24 - length(ts_train)))
+    }
+    else {
+      start <- start(ts_train)
+    }
+    tslm(ts(rep(0, length(ts_train)), start = start, end = end(ts_train), frequency = frequency(ts_train)) ~ season, lambda="auto")
+  }
+  )
+  
+  flog.info(paste0(id_of_ts, ": ", "Seasonal regression trained"))
+  
+  list_mod[["TSLM.st"]] <- tryCatch({
+    tslm(ts_train ~ trend + season, lambda="auto")
+  },
+  error=function(cond){
+    message(cond) 
+    if(length(ts_train) < 24) start <- start(ts_train) - c(0, (24 - length(ts_train)))
+    else start <- start(ts_train)
+    tslm(ts(rep(0, length(ts_train)), start = start, end = end(ts_train), frequency = frequency(ts_train)) ~ trend + season, lambda="auto")
+  }
+  )
+
+  flog.info(paste0(id_of_ts, ": ", "Trend + Seasonal regression trained"))
+
+  list_mod[["HW.mul"]] <- tryCatch({
+    HoltWinters(ts_train, seasonal = "mul")
+  },
+  error=function(cond){
+    message(cond)
+    if(length(ts_train) < 24) start <- start(ts_train) - c(0, (24 - length(ts_train)))
+    else start <- start(ts_train)
+    HoltWinters(ts(rep(0, length(ts_train)), start = start, end = end(ts_train), frequency = frequency(ts_train)))
+  }
+  )
+
+  flog.info(paste0(id_of_ts, ": ", "Holt-Winters multiplicative trained"))
+
+  list_mod[["HW.add"]] <- tryCatch({
+    HoltWinters(ts_train, seasonal = "add")
+  },
+  error=function(cond){
+    message(cond)
+    if(length(ts_train) < 24) start <- start(ts_train) - c(0, (24 - length(ts_train)))
+    else start <- start(ts_train)
+    HoltWinters(ts(rep(0, length(ts_train)), start = start, end = end(ts_train), frequency = frequency(ts_train)))
+  }
+  )
+
+  flog.info(paste0(id_of_ts, ": ", "Holt-Winters additive trained"))
+  
+  if(!skipTimeConsumingAlgorithmsFlag) {
+    list_mod[["ARIMA"]] <- tryCatch({
+      auto.arima(ts_train, max.p=2, max.q=2,
+                 max.P=2, max.Q=2, max.d=1, max.D=1, allowdrift = TRUE,
+                 stepwise=FALSE, approximation=FALSE,
+                 ic = "bic",  parallel = "TRUE")
+    },
+    error=function(cond){
+      message(cond)
+      return(NA)
+    }
+    )
+  
+    flog.info(paste0(id_of_ts, ": ", "ARIMA trained"))
+  
+    list_mod[["ARIMA.boxcox"]] <- tryCatch({
+      auto.arima(ts_train, max.p=2, max.q=2,
+                 max.P=2, max.Q=2, max.d=1, max.D=1, allowdrift = TRUE,
+                 stepwise=FALSE, approximation=FALSE, lambda="auto",
+                 ic = "bic", parallel = "TRUE")
+    },
+    error=function(cond){
+  
+      return(NA)
+    }
+    )
+  
+    flog.info(paste0(id_of_ts, ": ", "ARIMA with boxcox trained"))
+  
+    list_mod[["ets"]] <- tryCatch({
+      ets(ts_train, model="ZZZ", lambda = "auto", bounds = "both")
+    },
+    error=function(cond){
+      message(cond)
+      return(NA)
+    }
+    )
+  
+    flog.info(paste0(id_of_ts, ": ", "ETS trained"))
+  
+    list_mod[["tbats"]] <- tryCatch({
+      tbats(ts_train, use.box.cox = NULL, use.trend = NULL, use.damped.trend = NULL,
+            seasonal.periods = NULL, use.arma.errors = TRUE)
+    },
+    error=function(cond){
+      message(cond)
+      return(NA)
+    }
+    )
+  
+    flog.info(paste0(id_of_ts, ": ", "TBATS trained"))
+  }
+  return(list_mod)
+}
+
+
+forecast_with_external_regressors <- function(mod, ts_disruption_train, n){
+  tryCatch({
+    forecast(mod, xreg = ts_disruption_train, h = n)$mean[1]
+  },
+  error=function(cond){
+    message(cond)
+    return(0)
+  }
+  )
+}
+
+
+forecast_without_external_regressors <- function(mod, n){
+  tryCatch({
+    na_replace(forecast(mod, h = max(n))$mean) # Replace NA's with zeros.
+  },
+  error=function(cond){
+    message(cond)
+    return()
+  }
+  )
+}
+
+predict_ts_models <- function(list_mod, ts_val, forecasts_per_month, step, total_steps, months.ahead, id_of_ts, skipTimeConsumingAlgorithmsFlag){
+### Makes forecasts for each step by calling a function, which makes forecasts and creates a data frame with monthly forecasts from each model.
+### Parameters:
+### list_mod: A list containing all the trained models.
+### ts_val: The time series.
+### forecasts_per_month:
+### total_steps: 
+### months.ahead: The months ahead to be forecasted as a vector. 1 is the current (incomplete) month.
+### Returns: 
+  if(skipTimeConsumingAlgorithmsFlag) {
+  names <- c("Reg.seasonal", "Reg.trend.seasonal",
+             "HW.Mul", "HW.Add"
+             , "ARIMA", "ARIMA.boxcox"
+             , "ETS", "TBATS"
+             , "Naive.prev.year"#, "Naive.prev.datapoint"
+             )
+  } else {
+    names <- c("Reg.seasonal", "Reg.trend.seasonal",
+               "HW.Mul", "HW.Add"
+               , "ARIMA", "ARIMA.boxcox"
+               , "ETS", "TBATS"
+               , "Naive.prev.year"#, "Naive.prev.datapoint"
+    )
+  }
+  
+  
+  no_of_naive_models <- 1
+  # no_of_naive_models <- 2
+  for(j in 1:(length(list_mod) + no_of_naive_models)) {
+    # j <- 6
+    if (j <= length(list_mod)) {
+      one_month_forecast <- forecast_without_external_regressors(mod = list_mod[[j]], n = months.ahead)
+      flog.info(paste(paste0(id_of_ts, ":"), "Predictions made for", class(list_mod[[j]])[1], as.Date(as.yearmon(time(one_month_forecast)))))
+    } else { # Lastly, do the naive forecasts.
+          if(j == length(list_mod)+1) {
+            aux <- rbind(data.frame("Y" = forecasts_per_month[forecasts_per_month$model == "Base" & forecasts_per_month$date == max(subset(forecasts_per_month, type == "1_ahead")$date) - years(1), 1], date = max(subset(forecasts_per_month, type == "1_ahead")$date)), data.frame("Y" = forecasts_per_month[forecasts_per_month$model == "Base" & forecasts_per_month$date == max(subset(forecasts_per_month, type == "2_ahead")$date) - years(1), 1], date = max(subset(forecasts_per_month, type == "2_ahead")$date)), data.frame("Y" = forecasts_per_month[forecasts_per_month$model == "Base" & forecasts_per_month$date == max(subset(forecasts_per_month, type == "3_ahead")$date) - years(1), 1], date = max(subset(forecasts_per_month, type == "3_ahead")$date)), data.frame("Y" = forecasts_per_month[forecasts_per_month$model == "Base" & forecasts_per_month$date == max(subset(forecasts_per_month, type == "4_ahead")$date) - years(1), 1], date = max(subset(forecasts_per_month, type == "4_ahead")$date)))
+          } else {
+            aux <- rbind(data.frame("Y" = forecasts_per_month[forecasts_per_month$model == "Base" & forecasts_per_month$date == max(subset(forecasts_per_month, type == "1_ahead")$date) %m-% months(1), 1], date = max(subset(forecasts_per_month, type == "1_ahead")$date)), data.frame("Y" = forecasts_per_month[forecasts_per_month$model == "Base" & forecasts_per_month$date == max(subset(forecasts_per_month, type == "1_ahead")$date) %m-% months(1), 1], date = max(subset(forecasts_per_month, type == "2_ahead")$date)), data.frame("Y" = forecasts_per_month[forecasts_per_month$model == "Base" & forecasts_per_month$date == max(subset(forecasts_per_month, type == "1_ahead")$date) %m-% months(1), 1], date = max(subset(forecasts_per_month, type == "3_ahead")$date)), data.frame("Y" = forecasts_per_month[forecasts_per_month$model == "Base" & forecasts_per_month$date == max(subset(forecasts_per_month, type == "1_ahead")$date) %m-% months(1), 1], date = max(subset(forecasts_per_month, type == "4_ahead")$date)))
+        }
+        ts.forecast <- as.xts(aux$Y, order.by = as.Date(aux$date))
+        ts.all <- ts(ts.forecast, start = c(year(as.Date(time(ts.forecast))[1]), month(as.Date(time(ts.forecast))[1]), week(as.Date(time(ts.forecast))[1])), 
+                     end = c(year(as.Date(time(ts.forecast))[length(ts.forecast)]), month(as.Date(time(ts.forecast))[length(ts.forecast)]), 
+                     week(as.Date(time(ts.forecast))[length(ts.forecast)])), 
+                     frequency = 12)
+        one_month_forecast <- ts.all
+        flog.info(paste(paste0(id_of_ts, ":"), "Predictions made for Naive no ", j - 4, as.Date(as.yearmon(time(one_month_forecast)))))
+      }
+        
+    p <- 1
+    for(p in months.ahead){
+      if((step+p-1) < total_steps){
+        forecasts_per_month <- rbind(forecasts_per_month, data.frame(Y=as.matrix(one_month_forecast[p]), date=as.Date(as.yearmon(time(one_month_forecast)[p])), model = names[j], type = paste0(p, "_ahead")))
+        row.names(forecasts_per_month) <- seq(1, nrow(forecasts_per_month), by = 1)
+      }else if(step == total_steps){
+        forecasts_per_month <- rbind(forecasts_per_month, data.frame(Y=as.matrix(one_month_forecast[p]), date=as.Date(as.yearmon(time(one_month_forecast)[p])), model = names[j],
+                                                type = paste0(p, "_ahead")))
+        row.names(forecasts_per_month) <- seq(1, nrow(forecasts_per_month), by = 1)
+      }
+    }
+  }
+  return(forecasts_per_month)
+}
+
+create_train_test <- function(start_train, start_test, ts.all, step, number.of.steps.in.test, months.ahead){
+### Creates the training and testing datasets.
+### Parameters:
+### start_train: The start date of the training dataset.
+### start_test: The start date of the testing dataset.
+### ts_all: The time series.
+### step: The current step number, i.e., the current position of the "test set window".
+### number.of.steps.in.test: The total number of steps in the test set.
+### months.ahead: The months ahead to be forecasted as a vector. 1 is the current (incomplete) month.
+### Returns: A list with the given step's training time series as the first element and the forecasts based on
+### that time series as the second element.
+
+ts_train <- window(ts.all, start = c(year(as.Date(start_train)), month(as.Date(start_train))), end = c(year(as.Date(start_test + months(step) - months(2))), month(start_test + months(step) - months(2))), frequency = frequency(ts.all))
+
+  ts_vsl_list <- list() # A list to hold the forecasts
+  for(j in months.ahead){
+    # j <- 1
+    if((step + j - 1) < number.of.steps.in.test){ # If this step plus the number of months the current forecast is ahead is within the test set, i.e, not out-of-sample
+      ts_vsl_list[j] <- window(ts.all, start = c(year(start_test), month(start_test + months(step + j - 2))), end = c(year(as.Date(start_test)), month(start_test + months(step + j - 2))), frequency = frequency(ts.all)) 
+    } else{ # If this step plus the number of months the current forecast is ahead is beyond the test set, i.e., out-of-sample
+      # ts_vsl_list[j] <- ts(0, frequency=frequency(ts.all), start=c(year(as.Date(start_test)), month(as.Date(start_test)) - 1 + step + (j - 1)))
+      ts_vsl_list[j] <- ts(0, frequency = frequency(ts.all), start = c(year(start_test), month(start_test + months(step + j - 2))))
+    }
+  }
+  ts_train <- ifelse(ts_train == 0, 0.01, ts_train)
+
+  return(list(ts_train, ts_vsl_list))
+}
+
+
+split_data_and_model_monthly <- function(dataFull, list.ts, id_of_ts, months.ahead, start_test, start_train, first.month.to.forecast, mape.output.filename, progressCounter, skipTimeConsumingAlgorithmsFlag){
+### Creates the training and testing datasets and trains the time series models. Calls a function that does the predictions and then a function that does evaluations.
+### Parameters:
+### list.ts: List with the time series. The first element is with the imputated values (no zeros ever) and the second with the original values.
+### months.ahead: The months ahead to be forecasted as a vector. 1 is the current (incomplete) month.
+### output.filename: The filename used for saving MAPEs.
+### Returns: The value given by the last forecast.
+
+  # Do the splits for training and test sets.
+  if(exists("start_train")){
+    rm(start_train)
+    rm(start_test)
+  }
+
+  if(!exists("start_train")){
+    start_train <- min(as.Date(time(list.ts[[1]]))) # What is the starting point in our entire time series for our training (and test) set
+  }
+
+  if(!exists("start_test")){
+    start_test <- as.Date(time(list.ts[[1]]))[round(length(as.Date(time(list.ts[[1]])))*0.7)] # Our training set is 70% and the 30% after it is the test set
+  }
+  
+  if(start_train < min(as.Date(time(list.ts[[1]])))){
+    start_train <- min(as.Date(time(list.ts[[1]])))
+  }
+  
+  ts.all <- window(list.ts[[1]], start = c(year(as.Date(start_train)), month(as.Date(start_train))), frequency = frequency(list.ts[[1]]))
+  ts.all.original <- window(list.ts[[2]], start = c(year(as.Date(start_train)), month(as.Date(start_train))), frequency = frequency(list.ts[[1]]))
+  
+  number.of.steps.in.train <- length(ts.all[as.Date(as.yearmon(time(ts.all))) < start_test]) # The length of our training set.
+  
+  if(number.of.steps.in.train < 12) { # If the number of steps in the training set is less than twelve, but six or more, lengthen the training set by until it's twelve months
+    if(number.of.steps.in.train < 6) {
+      flog.warn(cat(red(paste("Skipping due to less than twelve months between start_train and start_test for", id_of_ts))))
+      return(NULL)
+    }
+    start_test <- as.Date(start_test) %m+% months(12 - number.of.steps.in.train)    
+    number.of.steps.in.train <- length(ts.all[as.Date(as.yearmon(time(ts.all))) < start_test])
+  }
+  
+  number.of.steps.in.test <- (length(ts.all) - number.of.steps.in.train) + 1 # The length of the test set is the training set's complement of one. The + 1 comes from the last step, which is the "true" out-of-sample forecast step of the months that we don't yet know the actual/true value for.
+  total.number.of.steps <- number.of.steps.in.test + max(months.ahead) # The number of training steps and the "true" out-of-sample forecast steps together.
+
+  # step represents the shift in the ending position of the "training set window". For example, if max(as.Date(time(list.ts[[1]]))) = "2023-12-01", start_train = "2013-03-01" and start_test = "2020-09-01", we get:
+  # step <- 1 # The "training set window" becomes:
+  #       Jan   Feb   Mar   Apr   May   Jun   Jul   Aug   Sep   Oct   Nov   Dec
+  # 2013              -1.0  -0.8   6.4   6.2   6.8   2.3   0.4  -5.4  -1.4   4.2
+  # 2014  -3.3  16.7  12.8  16.4   7.9   5.5   7.1   8.5   0.9   4.3   0.9   2.9
+  # 2015  13.8   7.6   3.1  -2.2  -5.9  -1.9   0.4   4.6   8.1  11.9   6.7   5.5
+  # 2016   2.4  -1.5   3.3  -0.4   6.7   2.6  -0.9   4.0  -4.1 -10.0  -1.0  -0.8
+  # 2017   6.4   6.2   6.8   2.3   0.4  -5.4  -1.4   4.2  -3.3  16.7  12.8  16.4
+  # 2018   7.9   5.5   7.1   8.5   0.9   4.3   0.9   2.9  13.8   7.6   3.1  -2.2
+  # 2019  -5.9  -1.9   0.4   4.6   8.1  11.9   6.7   5.5   2.4  -1.5   3.3  -0.4
+  # 2020   6.7   2.6  -0.9   4.0  -4.1 -10.0  -1.0  -0.8
+
+  # step <- 2 # The "training set window" lengthens by one becoming:
+  #         Jan   Feb   Mar   Apr   May   Jun   Jul   Aug   Sep   Oct   Nov   Dec
+  # 2013              -1.0  -0.8   6.4   6.2   6.8   2.3   0.4  -5.4  -1.4   4.2
+  # 2014  -3.3  16.7  12.8  16.4   7.9   5.5   7.1   8.5   0.9   4.3   0.9   2.9
+  # 2015  13.8   7.6   3.1  -2.2  -5.9  -1.9   0.4   4.6   8.1  11.9   6.7   5.5
+  # 2016   2.4  -1.5   3.3  -0.4   6.7   2.6  -0.9   4.0  -4.1 -10.0  -1.0  -0.8
+  # 2017   6.4   6.2   6.8   2.3   0.4  -5.4  -1.4   4.2  -3.3  16.7  12.8  16.4
+  # 2018   7.9   5.5   7.1   8.5   0.9   4.3   0.9   2.9  13.8   7.6   3.1  -2.2
+  # 2019  -5.9  -1.9   0.4   4.6   8.1  11.9   6.7   5.5   2.4  -1.5   3.3  -0.4
+  # 2020   6.7   2.6  -0.9   4.0  -4.1 -10.0  -1.0  -0.8   6.4
+
+  # step <- 3 # The "training set window" lengthens by one becoming:
+  #         Jan   Feb   Mar   Apr   May   Jun   Jul   Aug   Sep   Oct   Nov   Dec
+  # 2013              -1.0  -0.8   6.4   6.2   6.8   2.3   0.4  -5.4  -1.4   4.2
+  # 2014  -3.3  16.7  12.8  16.4   7.9   5.5   7.1   8.5   0.9   4.3   0.9   2.9
+  # 2015  13.8   7.6   3.1  -2.2  -5.9  -1.9   0.4   4.6   8.1  11.9   6.7   5.5
+  # 2016   2.4  -1.5   3.3  -0.4   6.7   2.6  -0.9   4.0  -4.1 -10.0  -1.0  -0.8
+  # 2017   6.4   6.2   6.8   2.3   0.4  -5.4  -1.4   4.2  -3.3  16.7  12.8  16.4
+  # 2018   7.9   5.5   7.1   8.5   0.9   4.3   0.9   2.9  13.8   7.6   3.1  -2.2
+  # 2019  -5.9  -1.9   0.4   4.6   8.1  11.9   6.7   5.5   2.4  -1.5   3.3  -0.4
+  # 2020   6.7   2.6  -0.9   4.0  -4.1 -10.0  -1.0  -0.8   6.4   6.2
+
+  # And so on, while the "test set window" is always the next four steps that come after the "training set window", such as for step = 1:
+  # [[2]]
+  # [[2]][[1]]
+  # [1] 6.4
+
+  # [[2]][[2]]
+  # [1] 6.2
+
+  # [[2]][[3]]
+  # [1] 6.8
+
+  # [[2]][[4]]
+  # [1] 2.3
+
+  # The "test set window" is what we can always evaluate our forecasts against made based on the "training set window" of each step, until our step reaches a point where the "test set window" goes over our last observation, "2023-12-01", in our training-test set after which we cannot evaluate anymore, because the forecasts are truly out-of-sample.
+
+  if (exists("forecasts.per.month")) {
+    rm(forecasts.per.month)
+  }
+  if (exists("temp.list")) {
+    rm(temp.list)
+  }
+
+  # Create the dataframe where to place the forecasts, first as a place holder consisting only of the observed values ("Base")
+  forecasts.per.month <- data.frame(Y=as.matrix(ts.all.original), date=as.Date(as.yearmon(time(ts.all.original))), model = "Base", type = "None")
+
+  # step <- 1
+  # step <- 2
+  # step <- 3
+  # step <- 4
+  # step <- 5
+  # step <- 39
+  for(step in 1:(number.of.steps.in.test)){
+    # print.progress(progressCounter, dataFull, id_of_ts)
+
+    flog.info(cat(red(paste("Step", step, "out of", number.of.steps.in.test))))
+    train_test_set <- create_train_test(start_train, start_test, ts.all.original, step, number.of.steps.in.test, months.ahead) # Where [[1]] is the current step's "training-test set window", and [[2]] holds the "test set window"
+
+    # Train the models with this "training set window":
+    list_mod <- train_ts_models(ts_train = train_test_set[[1]], id_of_ts, skipTimeConsumingAlgorithmsFlag)
+
+    # if(!exists("forecasts.per.month")){
+    # }
+
+    # Forecast this step:
+    # names(forecasts.per.month)[1] <- "Y"
+    forecasts.per.month <- predict_ts_models(list_mod, ts_val = train_test_set[[2]], forecasts_per_month = forecasts.per.month, step, total_steps = total.number.of.steps, months.ahead, id_of_ts, skipTimeConsumingAlgorithmsFlag)
+    # Sort forecasts.per.month by date ascending and then type
+    forecasts.per.month <- forecasts.per.month[order(forecasts.per.month$date, forecasts.per.month$type), ]
+    # Round to one desimal
+    forecasts.per.month$Y <- round(forecasts.per.month$Y, 1)
+    upper_limit = 10
+    # Cap forecasts over upper_limit
+    forecasts.per.month$Y[forecasts.per.month$Y > upper_limit] <- NA
+    forecasts.per.month$Y[is.na(forecasts.per.month$Y)] <- max(forecasts.per.month$Y, na.rm = TRUE)
+    forecasts.per.month$Y <- round(forecasts.per.month$Y, 1)
+    # print(forecasts.per.month)
+  }
+ 
+  # For target variables that should not have negative values, handle them:
+  # forecasts.per.month$Y <- ifelse(forecasts.per.month$Y < 0, 0, forecasts.per.month$Y)
+
+  temp.list <- evaluate_models(dataFull, ts_all = ts.all, ts_all_original = ts.all.original, forecasts.per.month, id_of_ts, start_test, months.ahead, first.month.to.forecast, progressCounter, mape.output.filename) # nolint
+  temp.list[[5]] <- forecasts.per.month # In temp.list [[1]] are the "best-performer out-of-sample forecasts" for each four, truly out-of-sample steps, [[2]] is the name of the "best-performer" for those forecasts, respectively, [[3]] is the "best-performer's" predictive performance metrics for each step in the test set, and [[4]] is the dataframe with all the observations and all the forecasts, both in-the-sample and out-of-sample.
+
+  flog.info(cat(red("The contents of temp.list:\n[[1]] are the 'best-performer out-of-sample forecasts' for each four, truly out-of-sample steps,\n[[2]] is the name of the 'best-performer' for those forecasts, respectively,\n[[3]] is the 'best-performer's' predictive performance metrics for each step in the test set, and\n[[4]] is the dataframe with all the observations and all the forecasts, both in-the-sample and out-of-sample.\n")))
+  return(temp.list)
+}
+
+prepare_data_for_evaluation <- function(ts_all, forecasts.subset, start.test, months.to.forecast){
+### Creates a list out of the forecast values.
+### Parameters:
+### ts_all: The time series.
+### forecasts: The forecasts.
+### start_test: The start date of the test data.
+### Returns:
+
+# For testing:
+# rm(pred)
+# months.to.forecast <- "1_ahead"
+# months.to.forecast <- "2_ahead"
+# months.to.forecast <- "3_ahead"
+# months.to.forecast <- "4_ahead"
+
+  flog.info("Preparing data for evaluation")
+  if(frequency(ts_all) == 12){
+    forecasts.subset <- forecasts.subset[forecasts.subset$date >= as.Date(start.test) %m+% months(as.numeric(substr(months.to.forecast, 1, 1))-1),]
+  }else{
+    forecasts.subset <- forecasts.subset[forecasts.subset$date >= nrow(forecasts[forecasts$model %in% "Base",]) - nrow(forecasts[forecasts$model %in% c("Reg.seasonal", "Reg", "reg"),])+1,]
+  }
+  forecasts_test_set <- forecasts.subset[forecasts.subset$date <= max(forecasts.subset$date[forecasts.subset$model %in% "Base"]),]
+
+  for(i in as.character(unique(forecasts_test_set$model))){
+    # i <- "Base"
+    # i <- "Reg.seasonal"
+    # i <- "Reg.trend.seasonal"
+    # i <- "HW.Mul"
+    # i <- "HW.Add"
+    # i <- "Naive.prev.year"
+    # i <- "Naive.prev.datapoint"
+    if (exists("pred")) {
+      tmp <- forecasts_test_set[forecasts_test_set$model == i, c("Y", "date")]
+      pred <- merge(pred, tmp, by = "date", all.x = TRUE)
+    } else {
+      pred <- forecasts_test_set[forecasts_test_set$model == i, c("Y", "date")]
+      pred <- data.frame(date = pred$date, ts(pred$Y))
+    }
+    names(pred)[2:length(names(pred))] <- as.character(unique(forecasts_test_set$model))[1:length(pred)-1]
+  }
+  
+  for (i in 2:ncol(pred)) {
+    pred[, i] <- ifelse(is.na(pred[, i]), 0, pred[, i])
+  }
+  
+  # for (i in 2:ncol(pred)) {
+  #   if (any(is.na(pred[, i]))) {
+  #     for (naValueIndex in which(is.na(pred[, i]))) {
+  #       if (naValueIndex > 1) {
+  #         if (naValueIndex < nrow(pred)) {
+  #           pred[naValueIndex, i] <- (pred[naValueIndex - 1, i] + pred[naValueIndex + 1, i]) / 2
+  #         } else {
+  #           pred[naValueIndex, i] <- pred[naValueIndex - 1, i]
+  #         }
+  #       } else {
+  #         pred[naValueIndex, i] <- pred[naValueIndex + 1, i]
+  #       }
+  #       if (is.na(pred[naValueIndex, i])) {
+  #         pred[naValueIndex, i] <- 0
+  #       }
+  #     }
+  #   }
+  # }
+  return(list(pred, forecasts_test_set))
+}
+
+error_metrics <- function(pred, id_of_ts, months.to.forecast, mape.output.filename = NULL){
+### Gets the error metrics.
+### Parameters:
+### mape.output.filename: The filename of a output text file with the MAPE outputs.
+### Returns:
+### The error metrics in a data frame.
+  
+  flog.info("Getting the error metrics.")
+  evaluation_in_whole_test <- rbind(accuracy(ts(pred[,3]), ts(pred$Base)))
+  for(i in 4:length(pred)){
+    evaluation_in_whole_test <- rbind(evaluation_in_whole_test, accuracy(ts(pred[,i]), ts(pred$Base))
+    )
+  }
+  
+  row.names(evaluation_in_whole_test) <- names(pred)[3:length(pred)]
+  
+  evaluation_in_whole_test <- data.frame(evaluation_in_whole_test)
+  evaluation_in_whole_test <- evaluation_in_whole_test[, (names(evaluation_in_whole_test) %in% c("RMSE", "MAE", "MAPE"))] # Because MAPE gives Inf in many cases (due to division by zero)
+  
+  if (!is.null(mape.output.filename)) {
+    print(paste(id_of_ts))
+    print(round(evaluation_in_whole_test[order(evaluation_in_whole_test$MAPE),], 5))
+    sink(file = paste(i, mape.output.filename, sep = "_"), append = TRUE)
+    print(paste(id_of_ts))
+    print(round(evaluation_in_whole_test[order(evaluation_in_whole_test$MAPE),], 5))
+    sink()
+  }
+  
+  return(evaluation_in_whole_test)
+}
+
+
+plot_base_forecasts <- function(forecasts, best.model.performance, months.ahead, id_of_ts, plotModelQuadrantGraphFlag = FALSE, plotBestPerformerErrorGraphsFlag = FALSE) {
+### Plots graphs for forecasts and realized values
+### Parameters:
+### forecasts:
+### best.model.performance:
+### months.ahead: The months ahead to be forecasted as a vector. 1 is the current (incomplete) month.
+### plotModelQuadrantGraphFlag:
+### plotBestPerformerErroGraphsFlag:
+  no_of_naive_models <- 1
+  # Create graphs with the realized demand and the forecast of each of the models in the same picture.
+  # k <- 1
+  options(repr.plot.width=30, repr.plot.height=8)
+  for (k in months.ahead) {
+    plots_list <- list()
+    for (j in seq(no_of_naive_models, length(unique(forecasts$model)), 1)) {
+      p <- ggplot(forecasts[forecasts$model %in% as.character(unique(forecasts$model)[c(1, j)]) & (forecasts$type == paste0(k, "_ahead") | (forecasts$date >= as.Date(as.yearmon(Sys.Date())) & na_replace(as.numeric(substr(forecasts$type, 1, 1)), 99) <= k) | forecasts$type == "None"), ], aes(x = date, y = Y, col = model)) +
+        geom_line() +
+        geom_point(size = 0.8) +
+        ylab("") +
+        xlab("") +
+        ggtitle(paste(id_of_ts, sep = " - "), subtitle = paste(paste0("Current + ", k - 1, " mon ahead"), "-", "Creation time:", Sys.time(), "UTC")) +
+        theme(axis.line = element_line(), axis.text = element_text(color = "black"), axis.title = element_text(colour = "black"), legend.text = element_text(), legend.title = element_text(), legend.key = element_rect(colour = "black"), plot.title = element_text(size = 10), plot.subtitle = element_text(size = 8))
+      plots_list <- c(plots_list, list(p))
+    }
+    # print(plots_list)
+
+    # plotModelQuadrantGraphFlag <- TRUE
+    if (plotModelQuadrantGraphFlag) {
+      # The first two models:
+      # svg(filename = paste(id_of_ts, k, "ahead", "page_1.svg", sep = "_"), width = 10.7, height = 6, pointsize = 3)
+      grid.arrange(plots_list[[1]], plots_list[[2]], ncol = 2, widths=c(2,2))
+      # dev.off()
+
+      # The next two models:
+      # svg(filename = paste(id_of_ts, k, "ahead", "page_2.svg", sep = "_"), width = 10.7, height = 6, pointsize = 3)
+      grid.arrange(plots_list[[3]], plots_list[[4]], ncol = 2, widths=c(2,2))
+
+      # The next two models:
+      # svg(filename = paste(id_of_ts, k, "ahead", "page_3.svg", sep = "_"), width = 10.7, height = 6, pointsize = 3)
+      grid.arrange(plots_list[[5]], plots_list[[6]], ncol = 2, widths=c(2,2))#,plots_list[[7]],plots_list[[8]], ncol = 2)
+      # dev.off()
+
+      # The next two models:
+      # svg(filename = paste(id_of_ts, k, "ahead", "page_4.svg", sep = "_"), width = 10.7, height = 6, pointsize = 3)
+      grid.arrange(plots_list[[7]], plots_list[[8]], ncol = 2, widths=c(2,2))#,plots_list[[7]],plots_list[[8]], ncol = 2)
+      # dev.off()
+
+      # The next two models:
+      # svg(filename = paste(id_of_ts, k, "ahead", "page_5.svg", sep = "_"), width = 10.7, height = 6, pointsize = 3)
+      grid.arrange(plots_list[[9]], plots_list[[10]], ncol = 2, widths=c(2,2))#,plots_list[[7]],plots_list[[8]], ncol = 2)
+      # dev.off()
+      
+      # The naive models:
+      # svg(filename = paste(id_of_ts, k, "ahead", "page_3.svg", sep = "_"), width = 10.7, height = 6, pointsize = 3)
+      # grid.arrange(plots_list[[9]],plots_list[[10]])
+      # dev.off()
+    }
+    
+    # Create error/residual graphs:
+    mape <- ggplot(best.model.performance, aes(x=Date,y=MAPE)) + geom_point() + ggtitle(paste(id_of_ts, paste0("best model: ", as.character(best.model.performance$name[1])), sep = " - ")) + geom_hline(yintercept=0, linetype = "longdash") + geom_hline(yintercept=0.2, linetype = "dashed", alpha = 0.5) + geom_hline(yintercept=-0.2, linetype = "dashed", alpha = 0.5) + xlab("") + ylab("forecast % difference to true value") + ylim(-1, 1) + theme(axis.line = element_line(), axis.text=element_text(color='black'), axis.title = element_text(colour = 'black'), legend.text=element_text(), legend.title=element_text(), legend.key = element_rect(colour = "black"))
+    
+    mae <- ggplot(best.model.performance, aes(x=Date,y=MAE)) + geom_point() + geom_hline(yintercept=0, linetype = "longdash") + xlab("") + ylab("forecast difference to true value") + theme(axis.line = element_line(), axis.text=element_text(color='black'), axis.title = element_text(colour = 'black'), legend.text=element_text(), legend.title=element_text(), legend.key = element_rect(colour = "black"))
+    
+    # plotBestPerformerErrorGraphsFlag <- TRUE
+    if (plotBestPerformerErrorGraphsFlag) {
+      svg(filename = paste(id_of_ts, k, "ahead", "best.svg", sep = "_"), width = 10.7, height = 6, pointsize = 3)
+      grid.arrange(mape, mae, ncol = 1)
+      dev.off()
+    }
+  }
+  return(list(mape, mae))
+}
+
+plot.summary.graph <- function(id_of_ts, demandsAndForecastWithYearCols, graph.filename, first.month.to.forecast) {
+  highestYear <- year(as.Date(first.month.to.forecast) %m-% months(1))
+  svg(filename = graph.filename, wid_of_tsth = 10.7, height = 6, pointsize = 3)
+  p <- ggplot(demandsAndForecastWithYearCols) +
+    geom_line(size = 2, aes(x = factor(row.names(demandsAndForecastWithYearCols), levels = row.names(demandsAndForecastWithYearCols)), y = threeYrAvg, col = "3 year average"), group = 1) +
+    geom_line(size = 1, aes(x = factor(row.names(demandsAndForecastWithYearCols), levels = row.names(demandsAndForecastWithYearCols)), y = fiveYrAvg, col = "5 year average"), group = 1) +
+    geom_line(aes(x = factor(row.names(demandsAndForecastWithYearCols), levels = row.names(demandsAndForecastWithYearCols)), y = prevYear, col = "Previous year"), group = 1) +
+    geom_line(aes(x = factor(row.names(demandsAndForecastWithYearCols), levels = row.names(demandsAndForecastWithYearCols)), y = pred, col = "Forecasts"), group = 1, linetype = "dashed") +
+    geom_point(shape = 15, size = 2, color = "red", aes(x = factor(row.names(demandsAndForecastWithYearCols), levels = row.names(demandsAndForecastWithYearCols)), y = pred, col = "Forecasts")) +
+    geom_line(aes(x = factor(row.names(demandsAndForecastWithYearCols), levels = row.names(demandsAndForecastWithYearCols)), y = currentYear, col = as.character(highestYear), group = 1)) +
+    geom_point(shape = 16, size = 3, aes(x = factor(row.names(demandsAndForecastWithYearCols), levels = row.names(demandsAndForecastWithYearCols)), y = currentYear, col = as.character(highestYear))) +
+    scale_color_manual(values = c("black", "green4", "orange", "red", "blue")) +
+    ylab("") +
+    xlab("") +
+    ggtitle(paste(toupper(id_of_ts), " forecasts:", sep = " - "), subtitle = paste0("Current (", as.yearmon(first.month.to.forecast), ") + 3 months ahead. Creation time: ",  Sys.time(), " UTC")) +
+    theme(axis.line = element_line(),
+          axis.text = element_text(color='black'),
+          axis.title = element_text(colour = 'black'),
+          legend.text = element_text(),
+          legend.title = element_blank(),
+          legend.key = element_rect(colour = "black"),
+          legend.position = "right",
+          plot.title = element_text(size = 12),
+          plot.subtitle = element_text(size = 10))
+  print(p)
+  dev.off()
+}
+
+best_model <- function(pred, forecasts.test.set, evaluation_in_whole_test, months.to.forecast){
+### Gets the best performing models based on MAPE (primary) or MAE (secondary).
+### Parameters:
+### pred: A data frame with forecasts.
+###
+  flog.info(paste("Determining the best models for", months.to.forecast))
+
+  # Filter out row index "Base" from evaluation_in_whole_test
+  evaluation_in_whole_test <- evaluation_in_whole_test[!(rownames(evaluation_in_whole_test) == "Base"), ]
+
+  # Compute the MAPEs and MAEs
+
+  if (exists("evaluation")) {
+    rm(evaluation)
+  }
+  # First Reg.trend.seasonal...
+  evaluation <- cbind((ts(pred[,!(names(pred) %in% c("date", "Base"))][1])-ts(pred$Base))/ts(pred$Base),(ts(pred[,!(names(pred) %in% c("date", "Base"))][1])-ts(pred$Base)))
+  # ...then the rest
+  for(i in 4:length(pred)){
+    evaluation <- cbind(evaluation, (ts(pred[,i]) - ts(pred$Base))/ts(pred$Base))
+    evaluation <- cbind(evaluation, (ts(pred[,i]) - ts(pred$Base)))
+  }
+  evaluation <- data.frame(evaluation)
+  names(evaluation) <- rep(names(pred)[3:length(pred)], times = 1, each = 2)
+  
+  if(any(!is.infinite(evaluation_in_whole_test$MAPE))) { # If at least one of the MAPEs is not infinite, use the MAPE, otherwise use MAE
+    best_model_performance <- data.frame(name = row.names(evaluation_in_whole_test[order(evaluation_in_whole_test$MAPE),][1,]), value = evaluation[,names(evaluation) %in% row.names(evaluation_in_whole_test[order(evaluation_in_whole_test$MAPE),][1,])], Date = forecasts.test.set$date[as.character(forecasts.test.set$model) %in% row.names(evaluation_in_whole_test[order(evaluation_in_whole_test$MAPE),][1,])])
+  } else {
+    best_model_performance <- data.frame(name = row.names(evaluation_in_whole_test[order(evaluation_in_whole_test$MAE),][1,]),value = evaluation[,names(evaluation) %in% row.names(evaluation_in_whole_test[order(evaluation_in_whole_test$MAE),][1,])], Date = forecasts.test.set$date[as.character(forecasts.test.set$model) %in% row.names(evaluation_in_whole_test[order(evaluation_in_whole_test$MAE),][1,])])
+  }
+  names(best_model_performance)[2:3] <- c("MAPE", "MAE")
+
+  return(best_model_performance)
+}
+
+
+evaluate_models <- function(dataFull, ts_all, ts_all_original, forecasts.per.month, id_of_ts, start_test, months.ahead, first.month.to.forecast, progressCounter, mape.output.filename, ...) {
+  ### Evaluates the performance of the models, determines the best performing model and calls functions for plotting 
+  ### and creating an Excel file for the best performing model's data.
+  ### Parameters:
+  ### ts_all: The time series object.
+  ### forecasts.per.month: The baseline (realized monthly demand) and all models' for all forecasts.
+  ### start_test: The start date for the testing dataset.
+  ### months.ahead: The months ahead to be forecasted as a vector. 1 is the current (incomplete) month.
+  ### mape.output.filename: The filename of a output text file with the MAPE outputs.
+  
+  highestYearinBase <-  max(year(subset(forecasts.per.month, model == "Base")$date))
+  highestYearinForecasts <-  max(year(forecasts.per.month$date))
+  flog.info("Evaluating models")
+  # forecasts[forecasts["model"] == "Base", "Y"] <- c(ts.all.original) # We do the evaluation against the original (non-imputed) realized values.
+  best.model.names.per.step <- c()
+
+  # Sort forecasts.per.month by date ascending and then type
+  forecasts.per.month <- forecasts.per.month[order(forecasts.per.month$date, forecasts.per.month$type), ]
+  # print(forecasts.per.month)
+
+  if (exists("pred")) {
+    rm(pred)
+  }
+  best.model.names.per.step <- NULL
+  for(months.to.forecast in as.character(unique(forecasts.per.month$type)[!(unique(forecasts.per.month$type) %in% "None")])){
+    # months.to.forecast <- "1_ahead"
+    # months.to.forecast <- "2_ahead"
+    # months.to.forecast <- "3_ahead"
+    # months.to.forecast <- "4_ahead"
+    flog.info(paste("Evaluating", months.to.forecast))
+    forecasts.subset <- forecasts.per.month[(forecasts.per.month$type == months.to.forecast | forecasts.per.month$type == "None"),]
+    forecasts.test.set <- prepare_data_for_evaluation(ts_all = ts_all_original, forecasts.subset, start.test = start_test, months.to.forecast)
+    evaluation.in.whole.test <- error_metrics(pred = forecasts.test.set[[1]], id_of_ts, months.to.forecast, mape.output.filename)
+    evaluation.in.whole.test <- as.data.frame(evaluation.in.whole.test)
+    best.model.performance <- best_model(pred = forecasts.test.set[[1]], forecasts.test.set = forecasts.test.set[[2]], evaluation_in_whole_test = evaluation.in.whole.test, months.to.forecast)
+    best.model.names.per.step <- append(best.model.names.per.step, as.character(best.model.performance$name[1]), length(best.model.names.per.step))
+  }
+  
+  forecastValues <- data.frame("fourth.month" = subset(forecasts.per.month, model == as.character(best.model.names.per.step[4]) & type == "4_ahead" & date == max(forecasts.per.month$date))$Y, "third.month" = subset(forecasts.per.month, model == as.character(best.model.names.per.step[3]) & type == "3_ahead" & as.yearmon(date) == as.yearmon(max(forecasts.per.month$date) %m-% months(1)))$Y, "second.month" = subset(forecasts.per.month, model == as.character(best.model.names.per.step[2]) & type == "2_ahead" & as.yearmon(date) == as.yearmon(max(forecasts.per.month$date) %m-% months(2)))$Y, "current.month" = subset(forecasts.per.month, model == as.character(best.model.names.per.step[1]) & type == "1_ahead" & as.yearmon(date) == as.yearmon(max(forecasts.per.month$date) %m-% months(3)))$Y)
+  
+  # Save the forecasts in a global variable so that summary graph plotting can access them.
+  assign(paste(id_of_ts, "4-month forecast", sep = "_"), forecastValues, envir = globalenv())
+  
+  return(list(forecastValues, best.model.names.per.step, best.model.performance, evaluation.in.whole.test))
+}
+
+print.progress <- function(progressCounter, dataFull, id_of_ts) {
+    flog.info(cat(red(paste0("\nOverall progress: ", round(100 * progressCounter / (length(unique(dataFull$id_of_ts)) * length(unique(dataFull$Value))), 1)), "%\n\n")))
+}
+```
+
+```{r}
+start_modeling_process <- function(){
+### The main function, which first sets up the environment, then fetches the data, iterates them through preparing
+### the time series for them, calls another function (split_data_and_model_monthly) for doing the model training and evaluation, uploads the summary graph onto.
+
+  id_of_tss <- list("USGDPGR")
+  
+  aggregateLevelForecastsFlag <- FALSE # Set TRUE if wanted to compute the forecasts on the data aggregated on the id_of_ts level.
+  plotModelQuadrantGraphFlag <- TRUE # Set TRUE if wanted to plot the "quadrant" of graphs, which show the performance of each algorithm against the realized demands data (the base).
+  plotBestPerformerErrorGraphsFlag <- FALSE # Set TRUE if wanted to plot the MAPE and MAE of the algorithms that was evaluated to have performed the best.
+  
+  runInDevEnvironmentFlag <- TRUE # Set TRUE if wanted to run the script in development environment instead of production.
+  disablePreviousMonthDataCheckFlag <- FALSE # Set TRUE if wanted to disable checking the the existance of data for the previous month.
+  
+  skipFetchingDataFlag <- FALSE # Set TRUE if wanted to run the script without fetching the data (instead use the data already in memory in global environment).
+  skipTimeConsumingAlgorithmsFlag <- FALSE # Set TRUE if wanted to skip the forecasts using the most time consuming 4 models (ARIMA, ARIMA + boxcox, ETS, TBATS).
+  skipComputingForecastsFlag <- FALSE # Set TRUE if wanted to run the script without computing the forecasts (instead use the forecasts already in memory in global environment).
+    
+  mape.output.filename <- NULL # Give a file name if wanted to save the MAPE results in a file.
+  imputations.output.filename <- NULL # Give a file name if wanted to save the records about imputations in a file.
+  
+  months.ahead <- c(1, 2, 3, 4) # By default we forecast 4 months ahead.
+  
+  if (!require("pacman")) install.packages("pacman") # get pcaman if not present and load it
+  pacman::p_load( # let pacman control packages
+    "data.table",  # data handling
+    "ini",  # for initialization
+    "httr",  # OAuth
+    "jsonlite",  # JSON parsing
+    "bigrquery",
+    "ggplot2",
+    "forecast",
+    "lubridate",
+    "futile.logger",
+    "argparse",
+    "imputeTS",
+    "gridExtra",
+    "tidyr",
+    "quantmod",
+    "zoo",
+    "GGally",
+    "caret",
+    "dplyr",
+    "nnfor",
+    "prophet",
+    "xlsx",
+    "DataCombine",
+    "googledrive",
+    "XLConnect",
+    "tools",
+    "crayon",
+    "rJava"
+  )
+  
+  first.month.to.forecast <- as.yearmon(Sys.Date())          # By default, the first month to forecast is the ongoing month.
+  start_test <- as.yearmon(Sys.Date() - years(1))            # By default, the test set starts from one year ago.
+  
+  if(disablePreviousMonthDataCheckFlag) {
+    first.month.to.forecast <- as.yearmon(as.Date(first.month.to.forecast) %m-% months(1))    # Subtract the number of months from now wanted to be disregarded. By default subtract one month (e.g if data missing from the previous month).
+    start_test <- as.Date(start_test) %m-% months(1)                                          # Subtract the same number of months as above from the start test date.
+  }
+  
+  start_test <- as.character(as.Date(start_test))
+  start_train <- "2015-06-01"
+  id_of_ts <- "USGDPGR"
+  
+  if(!skipFetchingDataFlag) {
+    dataFull <- preprocess_data(since = "2013-02-01", query = id_of_ts, first.month.to.forecast)
+    dataAggr <- preprocess_data(since = "2013-02-01", query = id_of_ts, first.month.to.forecast)
+  }
+  
+  # Let's keep this row here in comments and uncomment it if we want to see what the predictions would have been for months already realized. Set the filter condition
+  # below to the first day of the month you want filtered out (and all months that come after it).
+  # dataFull <- dataFull[format(dataFull$Date, "%Y-%m") < format(as.Date("2018-01-01"), "%Y-%m"),]
+  
+  progressCounter <- 1
+
+  if(skipComputingForecastsFlag) {
+    progressCounter <- progressCounter + length(id_of_tss)
+    flog.info(cat(red(paste("Skipping computing forecasts and trying to read them from memory instead as skipComputingForecastsFlag is set to TRUE.\n"))))
+    next # If wanted to skip making the forecasts.
+  }
+
+  if(!is.null(dataFull)) {
+    list.ts <- monthly_decomposition(dataFull, id_of_ts, imputations.output.filename) # Make the time series object.
+    
+    forecastValues.best.model.names.per.step.and.forecasts.per.month <- split_data_and_model_monthly(dataFull, list.ts, id_of_ts, months.ahead, start_test, start_train, first.month.to.forecast, mape.output.filename, progressCounter, skipTimeConsumingAlgorithmsFlag)
+
+    # print.progress(progressCounter, dataFull, id_of_ts)
+      
+    if(!is.null(forecastValues.best.model.names.per.step.and.forecasts.per.month)) {
+      # create.excel(forecastValues.best.model.names.per.step.and.forecasts.per.month[[3]], forecastValues.best.model.names.per.step.and.forecasts.per.month[[2]], id_of_ts) # TODO
+    }              
+    if (plotModelQuadrantGraphFlag | plotBestPerformerErrorGraphsFlag) { # If either flag was set, plot the corresponding plot(s).
+      plots <- plot_base_forecasts(forecasts = forecastValues.best.model.names.per.step.and.forecasts.per.month[[5]], best.model.performance = forecastValues.best.model.names.per.step.and.forecasts.per.month[[3]], months.ahead, id_of_ts, plotModelQuadrantGraphFlag, plotBestPerformerErrorGraphsFlag)
+    }
+
+    print("The best performing models for current month, current + 1 month, current + 2 months, and current + 3 months:")
+    print(forecastValues.best.model.names.per.step.and.forecasts.per.month[[2]])
+    print(forecastValues.best.model.names.per.step.and.forecasts.per.month[[3]])
+
+    # TODO:
+    # plot.summary.graph(id_of_ts, demandsAndForecastWithYearCols, graph.filename, first.month.to.forecast)
+  }   
+  progressCounter <- progressCounter + 1
+}
+```
+
+```{r}
+start_modeling_process()
+```
