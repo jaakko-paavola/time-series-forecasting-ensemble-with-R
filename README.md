@@ -1,5 +1,5 @@
 # An ensemble of time series models for forecasting with R
-Reads in a time series and fits in it:
+Reads in a time series and fits in it the following models:
 1) seasonal regression,
 2) trend + seasonal regression,
 3) Holt-Winters multiplicative,
